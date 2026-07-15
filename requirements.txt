@@ -1,0 +1,11 @@
+torch>=2.1
+torchvision
+numpy
+pillow
+matplotlib
+lmdb
+tqdm
+# for the PARSeq architecture-generality check (chunked_parseq.py)
+timm
+pytorch-lightning
+nltk
