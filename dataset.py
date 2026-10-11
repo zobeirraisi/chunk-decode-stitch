@@ -102,24 +102,51 @@ class LmdbDataset(Dataset):
 
     The LMDB environment is opened lazily inside each worker process because
     `lmdb.Environment` objects cannot be pickled across the DataLoader fork.
-    Out-of-charset / over-length labels are handled on the fly by resampling,
-    which avoids an expensive full-database scan at construction time.
+
+    Samples whose cleaned label is empty or longer than ``max_len`` are handled
+    differently for training and evaluation:
+
+    * training (``eval_mode=False``): replaced on the fly by a random other
+      sample, which avoids a full label scan of the large synthetic sets;
+    * evaluation (``eval_mode=True``, the default when ``augment=False``):
+      excluded once at construction, so every valid image is evaluated exactly
+      once and ``len()`` is the number of evaluated images (the DTRB/PARSeq
+      protocol). Nothing is resampled; an unreadable image raises an error.
     """
 
     def __init__(self, root: str, converter: LabelConverter,
-                 img_h: int = 32, img_w: int = 128, augment: bool = False):
+                 img_h: int = 32, img_w: int = 128, augment: bool = False,
+                 eval_mode=None):
         self.root = root
         self.converter = converter
         self.transform = build_transform(img_h, img_w, augment)
         # Always-available clean transform, used as a fallback if a random
         # augmentation throws on a pathological sample (keeps long runs alive).
         self.clean_transform = build_transform(img_h, img_w, False)
+        self.eval_mode = (not augment) if eval_mode is None else bool(eval_mode)
         self._env = None
         env = lmdb.open(root, readonly=True, lock=False,
                         readahead=False, meminit=False)
         with env.begin(write=False) as txn:
-            self.n_samples = int(txn.get(b"num-samples"))
+            n_total = int(txn.get(b"num-samples"))
+            self.keys = None
+            if self.eval_mode:
+                self.keys = []
+                for key in range(1, n_total + 1):  # LMDB keys are 1-indexed
+                    label = txn.get(f"label-{key:09d}".encode())
+                    if label is None:
+                        continue
+                    cleaned = converter.clean(label.decode("utf-8", "ignore"))
+                    if 0 < len(cleaned) <= converter.max_len:
+                        self.keys.append(key)
         env.close()
+        self.n_total = n_total
+        self.n_samples = n_total if self.keys is None else len(self.keys)
+        self.n_excluded = n_total - self.n_samples
+
+    def lmdb_key(self, index: int) -> int:
+        """LMDB key of the index-th sample (only valid samples in eval mode)."""
+        return self.keys[index] if self.keys is not None else index + 1
 
     @property
     def env(self):
@@ -132,7 +159,15 @@ class LmdbDataset(Dataset):
         return self.n_samples
 
     def __getitem__(self, index):
-        # LMDB keys are 1-indexed.
+        if self.eval_mode:
+            key = self.lmdb_key(index)
+            with self.env.begin(write=False) as txn:
+                label = txn.get(f"label-{key:09d}".encode()).decode("utf-8", "ignore")
+                imgbuf = txn.get(f"image-{key:09d}".encode())
+            image = self.transform(Image.open(io.BytesIO(imgbuf)).convert("RGB"))
+            tgt_in, tgt_out = self.converter.encode(label)
+            return image, tgt_in, tgt_out
+        # Training: LMDB keys are 1-indexed; invalid samples are resampled.
         for _ in range(10):
             key = index + 1
             with self.env.begin(write=False) as txn:
@@ -173,11 +208,11 @@ def build_training_set(data_root: str, converter: LabelConverter,
             for split in ("train", "val", "test"):
                 p = os.path.join(data_root, "training", "MJ", split)
                 if os.path.isdir(p):
-                    subsets.append(LmdbDataset(p, converter, img_h, img_w, augment))
+                    subsets.append(LmdbDataset(p, converter, img_h, img_w, augment, eval_mode=False))
         else:
             p = os.path.join(data_root, "training", src)
             if os.path.isdir(p):
-                subsets.append(LmdbDataset(p, converter, img_h, img_w, augment))
+                subsets.append(LmdbDataset(p, converter, img_h, img_w, augment, eval_mode=False))
     if not subsets:
         raise FileNotFoundError(f"No training LMDBs found under {data_root} for {sources}")
     return ConcatDataset(subsets) if len(subsets) > 1 else subsets[0]
@@ -193,7 +228,7 @@ def build_union14m_train(union_root, converter, tiers=UNION14M_TIERS,
     for tier in tiers:
         p = os.path.join(union_root, f"filter_train_{tier}")
         if os.path.isdir(p):
-            subsets.append(LmdbDataset(p, converter, img_h, img_w, augment))
+            subsets.append(LmdbDataset(p, converter, img_h, img_w, augment, eval_mode=False))
     if not subsets:
         raise FileNotFoundError(f"No Union14M-L tiers found under {union_root} for {tiers}")
     return ConcatDataset(subsets) if len(subsets) > 1 else subsets[0]
