@@ -23,9 +23,10 @@ from ltb_data import load_bucket, resize_aspect_preserving
 LTB_ROOT = os.path.expanduser("~/Documents/RESEARCH/STR-NEXT/data/ltb")
 BASE_CKPT = "checkpoints/base_union14m_grid_fs8_best.pt"
 FT_CKPT = "checkpoints/finetune_u14mbase_v6at_long.pt"
-OUT = os.path.expanduser(
+OUT = os.environ.get("QUAL_OUT", os.path.expanduser(
     "~/Documents/RESEARCH/STR-NEXT/paper2-longtext/neurocomputing/figures/"
-    "qualitative_ltb.png")
+    "qualitative_ltb.png"))
+WIDTH = float(os.environ.get("QUAL_WIDTH", "4.79"))  # inches; supplement text width
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
@@ -95,24 +96,38 @@ def main():
         print(f"  [{r[6]}] gt={r[1]!r}\n      base={r[2]!r} ({r[4]:.0f})"
               f"\n      ours={r[3]!r} ({r[5]:.0f})")
 
-    n = len(picks)
-    fig, axes = plt.subplots(n, 1, figsize=(7.2, 1.72 * n))
-    if n == 1:
-        axes = [axes]
-    for ax, (img_path, gt, pb, pf, cb, cf, bucket) in zip(axes, picks):
+    # print-size rendering: drawn at the target text width so the
+    # monospace text is ~7 pt on the page; long lines wrap
+    fs, fig_w = 7.0, WIDTH
+    line_h, pitch = 1.3 * fs / 72.0, 0.6 * fs / 72.0
+    max_chars = int(fig_w / pitch)
+    blocks = []
+    for (img_path, gt, pb, pf, cb, cf, bucket) in picks:
         img = resize_aspect_preserving(Image.open(img_path).convert("RGB"))
-        ax.imshow(img)
-        ax.set_xticks([]); ax.set_yticks([])
-        for s in ax.spines.values():
-            s.set_edgecolor("#bbbbbb")
-        txt = (f"GT:   {gt}\n"
-               f"Base: {pb}   (CER {cb:.0f}%)\n"
-               f"Ours: {pf}   (CER {cf:.0f}%)")
-        ax.text(0, -0.34, txt, transform=ax.transAxes, family="monospace",
-                fontsize=7.4, va="top", ha="left", linespacing=1.35)
-    fig.subplots_adjust(hspace=1.15, left=0.02, right=0.98, top=0.99,
-                        bottom=0.02)
-    fig.savefig(OUT, dpi=200, bbox_inches="tight")
+        img_h = min(fig_w * 32 / img.size[0], 0.45)
+        lines = []
+        for tag, text in (("GT:   ", gt), ("Base: ", pb), ("Ours: ", pf)):
+            body = max_chars - len(tag)
+            chunks = [text[k:k + body] for k in range(0, max(len(text), 1), body)]
+            lines += [(tag if i == 0 else " " * len(tag)) + c for i, c in enumerate(chunks)]
+        title = f"{len(gt)} characters: CER {cb:.0f}% (base) \u2192 {cf:.0f}% (fine-tuned)"
+        blocks.append((img, img_h, title, lines, 1.4 * line_h + img_h + 0.05 + line_h * len(lines) + 0.5 * line_h))
+    H = sum(b[-1] for b in blocks)
+    fig = plt.figure(figsize=(fig_w, H))
+    top = H
+    for img, img_h, title, lines, h in blocks:
+        fig.text(0, top / H, title, fontsize=fs + 0.5, fontweight="bold", va="top")
+        y = top - 1.4 * line_h
+        ax = fig.add_axes([0, (y - img_h) / H, (img_h * img.size[0] / 32) / fig_w, img_h / H])
+        ax.imshow(img, aspect="auto"); ax.set_axis_off()
+        y -= img_h + 0.05
+        for ln in lines:
+            fig.text(0, y / H, ln, family="monospace", fontsize=fs, va="top")
+            y -= line_h
+        top -= h
+    os.makedirs(os.path.dirname(OUT), exist_ok=True)
+    fig.savefig(OUT, bbox_inches="tight", pad_inches=0.02)
+    fig.savefig(OUT.replace(".pdf", ".png"), dpi=220, bbox_inches="tight", pad_inches=0.02)
     print(f"\nwrote {OUT}")
 
 
